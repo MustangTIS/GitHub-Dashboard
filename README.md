@@ -2,7 +2,7 @@
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
 ![Python](https://img.shields.io/badge/Python-3.x-%233776AB?logo=python&logoColor=white)
-![Language](https://img.shields.io/badge/Language-%E6%97%A5%E6%9C%AC%E8%AA%E5%AD%97%20(Japanese)-green)
+![Language](https://img.shields.io/badge/Language-Japanese-green)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
 GitHubリポジトリの各種統計情報（リリースダウンロード数・コード行数・使用言語比率・コミット活動パターン）を自動集計し、綺麗で見やすいタブ式HTMLダッシュボードを生成するPythonスクリプトです。
