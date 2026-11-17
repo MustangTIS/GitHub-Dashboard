@@ -11,6 +11,10 @@ GitHubリポジトリの各種統計情報（リリースダウンロード数�
 
 ---
 
+[![GitHub release](https://img.shields.io/github/v/release/MustangTIS/GitHub-Dashboard?include_prereleases=&sort=semver&color=blue)](https://github.com/MustangTIS/GitHub-Dashboard/releases/latest)
+
+---
+
 ## ✨ 主な機能
 
 - **📊 ダウンロード・トレンド分析**: リポジトリごとのリリースダウンロード数と、前回スキャン時からの差分（前回比）を可視化。
