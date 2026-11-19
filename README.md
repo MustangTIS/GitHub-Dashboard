@@ -7,7 +7,9 @@
 
 GitHubリポジトリの各種統計情報（リリース別・累計ダウンロード数、コード行数、使用言語比率、コミット活動パターン）を自動集計し、ダークテーマのインタラクティブなWebダッシュボード（`index.html` + Chart.js）とJSONデータを生成するPythonスクリプトです。
 
-![GitHub Dashboard Preview](./screenshot.png)
+![GitHub Dashboard Preview1](./screenshot1.jpg)
+
+![GitHub Dashboard Preview2](./screenshot2.jpg)
 
 <!-- 言語比率タブのプレビューを併載する場合はこちらを有効化してください
 ![GitHub Dashboard Languages](./screenshot2.png)
