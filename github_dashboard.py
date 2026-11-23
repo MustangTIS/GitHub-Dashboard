@@ -14,6 +14,9 @@ def load_config():
     default_config = {
         "github_token": "your_github_token_here",
         "output_dir": "github_report_output",
+        "default_category": "未分類",
+        "auto_save_repos": True,
+        "repos": {},
     }
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
       json.dump(default_config, f, indent=2, ensure_ascii=False)
@@ -31,10 +34,31 @@ def load_config():
     exit(1)
 
 
+def save_config(cfg):
+  with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
 CONFIG = load_config()
 TOKEN = CONFIG.get("github_token", "")
 OUTPUT_DIR = CONFIG.get("output_dir", "github_report_output")
+DEFAULT_CATEGORY = (CONFIG.get("default_category") or "未分類").strip() or "未分類"
+AUTO_SAVE_REPOS = bool(CONFIG.get("auto_save_repos", False))
+REPO_SETTINGS = CONFIG.get("repos") if isinstance(CONFIG.get("repos"), dict) else {}
 HISTORY_JSON = os.path.join(OUTPUT_DIR, "all_repositories_stats.json")
+
+
+def get_repo_pref(full_repo_name: str, repo_name: str):
+  """full_repo_name (owner/repo) または repo_name から表示可否とカテゴリを取得"""
+  entry = REPO_SETTINGS.get(full_repo_name)
+  if entry is None:
+    entry = REPO_SETTINGS.get(repo_name)
+  if isinstance(entry, dict):
+    visible = bool(entry.get("visible", True))
+    cat_raw = entry.get("category")
+    category = str(cat_raw).strip() if cat_raw is not None and str(cat_raw).strip() else DEFAULT_CATEGORY
+    return visible, category
+  return True, DEFAULT_CATEGORY
 
 
 def safe_id(name: str) -> str:
@@ -120,6 +144,27 @@ def analyze_code_content(blob_url, token, filename):
   }
 
 
+def group_repos_by_category(repos_list, predicate=None):
+  """カテゴリ順にリポジトリをまとめる（通常カテゴリ -> デフォルトカテゴリ）"""
+  grouped = {}
+  order = []
+  for repo in repos_list:
+    if predicate and not predicate(repo):
+      continue
+    cat = repo.get("category") or DEFAULT_CATEGORY
+    if cat not in grouped:
+      grouped[cat] = []
+      order.append(cat)
+    grouped[cat].append(repo)
+
+  def sort_key(c):
+    if c == DEFAULT_CATEGORY:
+      return (1, "zzz_" + c)
+    return (0, c.lower())
+
+  return [(c, grouped[c]) for c in sorted(order, key=sort_key)]
+
+
 def main():
   if not TOKEN or TOKEN == "your_github_token_here":
     print("❌ 有効な GitHub Token が設定されていません。")
@@ -154,6 +199,24 @@ def main():
     )
     return
 
+  # 未登録リポジトリの設定雛形を自動追記（auto_save_repos: true の場合のみ）
+  config_updated = False
+  if bool(CONFIG.get("auto_save_repos", True)):
+    if "repos" not in CONFIG or not isinstance(CONFIG["repos"], dict):
+      CONFIG["repos"] = {}
+    for repo in repos:
+      full_name = f"{repo['owner']['login']}/{repo['name']}"
+      if full_name not in CONFIG["repos"] and repo["name"] not in CONFIG["repos"]:
+        CONFIG["repos"][full_name] = {
+            "visible": True,
+            "category": DEFAULT_CATEGORY,
+        }
+        REPO_SETTINGS[full_name] = CONFIG["repos"][full_name]
+        config_updated = True
+    if config_updated:
+      save_config(CONFIG)
+      print(f"📝 新規リポジトリを '{CONFIG_FILE}' に自動追記しました。")
+
   today_str = datetime.date.today().isoformat()
   grand_total_downloads = 0
   grand_total_code_lines = 0
@@ -161,6 +224,7 @@ def main():
   grand_total_commits = 0
 
   all_stats = {"scan_date": today_str, "all_repositories": []}
+  visible_repositories = []
   global_languages = {}
 
   weekdays_count = [0] * 7
@@ -179,14 +243,20 @@ def main():
       primary_owner = owner
 
     repo_name = repo["name"]
+    full_repo_name = f"{owner}/{repo_name}"
+    is_visible, category = get_repo_pref(full_repo_name, repo_name)
+
+    if not is_visible:
+      print(f"⏭️ 非表示スキップ: {full_repo_name} [{category}]")
+      continue
+
     description = (repo.get("description") or "").strip()
     pushed_at = (repo.get("pushed_at") or "")[:10]
     dom_id = safe_id(f"{owner}_{repo_name}")
     default_branch = repo.get("default_branch", "main")
     is_private = repo["private"]
-    full_repo_name = f"{owner}/{repo_name}"
 
-    print(f"🔍 分析中: {full_repo_name}")
+    print(f"🔍 分析中: {full_repo_name} [{category}]")
 
     # A. 使用言語比率
     lang_url = f"https://api.github.com/repos/{owner}/{repo_name}/languages"
@@ -294,6 +364,8 @@ def main():
     repo_info = {
         "repository": full_repo_name,
         "repo_name": repo_name,
+        "category": category,
+        "visible": True,
         "description": description,
         "pushed_at": pushed_at,
         "dom_id": dom_id,
@@ -313,6 +385,7 @@ def main():
         },
     }
     all_stats["all_repositories"].append(repo_info)
+    visible_repositories.append(repo_info)
 
     print(f"   └─ 📁 ファイル: {file_count} | 📂 フォルダ: {dir_count}")
     print(
@@ -331,7 +404,18 @@ def main():
   with open(HISTORY_JSON, "w", encoding="utf-8") as f:
     json.dump(all_stats, f, ensure_ascii=False, indent=2)
 
-  repo_count = len(all_stats["all_repositories"])
+  repo_count = len(visible_repositories)
+  categories_sorted = [
+      c for c, _ in group_repos_by_category(visible_repositories)
+  ]
+  category_options_html = (
+      '<option value="__ALL__">すべてのカテゴリ</option>\n'
+      + "\n".join(
+          f'<option value="{escape_html(c)}">{escape_html(c)}</option>'
+          for c in categories_sorted
+      )
+  )
+
   dashboard_payload = {
       "primary_owner": primary_owner,
       "scan_date": today_str,
@@ -340,7 +424,7 @@ def main():
       "weekdays_count": weekdays_count,
       "hour_labels": hour_labels,
       "hours_count": hours_count,
-      "repositories": all_stats["all_repositories"],
+      "repositories": visible_repositories,
   }
   payload_json = json.dumps(dashboard_payload, ensure_ascii=False).replace(
       "</script>", "<\\/script>"
@@ -352,7 +436,13 @@ def main():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GitHub Dashboard - {primary_owner}</title>
+    <title>{escape_html(primary_owner)} の GitHub 詳細レポート</title>
+    <meta name="description" content="{escape_html(primary_owner)} の GitHub リポジトリ詳細レポート。リリース別・累計ダウンロード数、コード行数（LOC）、使用言語比率、コミット活動パターンを一覧で可視化します。">
+    <meta name="author" content="{escape_html(primary_owner)}">
+    <meta property="og:type" content="website">
+    <meta property="og:title" content="{escape_html(primary_owner)} の GitHub 詳細レポート">
+    <meta property="og:description" content="{escape_html(primary_owner)} の GitHub リポジトリ詳細レポート。リリース別・累計ダウンロード数、コード行数（LOC）、使用言語比率、コミット活動パターンを一覧で可視化します。">
+    <meta name="twitter:card" content="summary">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
@@ -482,20 +572,23 @@ def main():
         }}
         .filter-box {{
             display: flex;
+            flex-wrap: wrap;
             align-items: center;
             gap: 8px;
         }}
-        .filter-input {{
+        .filter-select, .filter-input {{
             background: var(--bg-card);
             border: 1px solid var(--border);
             color: var(--text-main);
             border-radius: 9px;
             padding: 8px 12px;
             font-size: 0.86rem;
-            min-width: 220px;
             outline: none;
         }}
-        .filter-input:focus {{
+        .filter-input {{
+            min-width: 210px;
+        }}
+        .filter-select:focus, .filter-input:focus {{
             border-color: var(--accent);
         }}
         .tab-content {{
@@ -520,6 +613,54 @@ def main():
             margin: 0;
             color: var(--text-muted);
             font-size: 0.86rem;
+        }}
+        .category-group {{
+            margin-bottom: 26px;
+        }}
+        .category-heading {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin: 0 0 12px;
+            padding: 6px 8px;
+            border-radius: 8px;
+            border-bottom: 1px solid rgba(51, 65, 85, 0.8);
+            font-size: 1.02rem;
+            font-weight: 700;
+            color: var(--accent);
+            cursor: pointer;
+            user-select: none;
+            transition: background-color 0.15s ease;
+        }}
+        .category-heading:hover {{
+            background: rgba(56, 189, 248, 0.08);
+        }}
+        .category-count {{
+            font-size: 0.76rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            padding: 1px 8px;
+            border-radius: 999px;
+        }}
+        .category-toggle-icon {{
+            margin-left: auto;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            transition: transform 0.2s ease;
+        }}
+        .category-group.collapsed {{
+            margin-bottom: 14px;
+        }}
+        .category-group.collapsed .category-heading {{
+            margin-bottom: 0;
+        }}
+        .category-group.collapsed .category-toggle-icon {{
+            transform: rotate(-90deg);
+        }}
+        .category-group.collapsed > :not(.category-heading) {{
+            display: none;
         }}
         .dl-repo-list {{
             display: flex;
@@ -551,6 +692,12 @@ def main():
             color: var(--accent);
             text-decoration: underline;
         }}
+        .header-badges {{
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }}
         .repo-desc {{
             font-size: 0.83rem;
             color: var(--text-muted);
@@ -577,6 +724,32 @@ def main():
             border: 1px solid rgba(51, 65, 85, 0.7);
             border-radius: 10px;
             padding: 12px;
+        }}
+        .chart-toolbar {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }}
+        .toggle-switch {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            cursor: pointer;
+            user-select: none;
+        }}
+        .toggle-switch input {{
+            accent-color: var(--accent);
+            cursor: pointer;
+        }}
+        .single-chart-wrap {{
+            position: relative;
+            height: 240px;
+            width: 100%;
         }}
         .chart-box-title {{
             font-size: 0.8rem;
@@ -624,7 +797,7 @@ def main():
         }}
         @media (max-width: 520px) {{
             .grid-container {{ grid-template-columns: 1fr; }}
-            .filter-input {{ min-width: 100%; }}
+            .filter-input, .filter-select {{ width: 100%; min-width: 0; }}
         }}
         .badge {{
             font-size: 0.72rem;
@@ -633,6 +806,10 @@ def main():
             background: rgba(148, 163, 184, 0.15);
             color: var(--text-muted);
             white-space: nowrap;
+        }}
+        .badge.cat {{
+            background: rgba(56, 189, 248, 0.14);
+            color: var(--accent);
         }}
         .badge.private {{
             background: rgba(251, 191, 36, 0.15);
@@ -669,7 +846,7 @@ def main():
 <body>
 <div class="container">
     <header>
-        <h1><a href="https://github.com/{primary_owner}" target="_blank" title="GitHubプロフィールを開く">🚀 {escape_html(primary_owner)} GitHub Dashboard</a></h1>
+        <h1><a href="https://github.com/{escape_html(primary_owner)}" target="_blank" title="GitHubプロフィールを開く">🚀 {escape_html(primary_owner)} GitHub Dashboard</a></h1>
         <div class="scan-badge">📅 スキャン日: {today_str}</div>
     </header>
 
@@ -677,7 +854,7 @@ def main():
         <div class="kpi-card">
             <div class="kpi-label">総合ダウンロード数</div>
             <div class="kpi-value green">{grand_total_downloads:,}</div>
-            <div class="kpi-sub">全リリースアセット合計</div>
+            <div class="kpi-sub">表示対象リポジトリ合計</div>
         </div>
         <div class="kpi-card">
             <div class="kpi-label">純コード行数 (LOC)</div>
@@ -692,7 +869,7 @@ def main():
         <div class="kpi-card">
             <div class="kpi-label">対象リポジトリ</div>
             <div class="kpi-value">{repo_count:,}</div>
-            <div class="kpi-sub">スキャン完了リポジトリ</div>
+            <div class="kpi-sub">表示中（全 {len(categories_sorted)} カテゴリ）</div>
         </div>
     </section>
 
@@ -704,6 +881,9 @@ def main():
             <button class="tab-btn" onclick="openTab(event, 'tab-activity')">📅 活動パターン</button>
         </div>
         <div class="filter-box">
+            <select id="category-filter" class="filter-select" onchange="filterRepos()">
+                {category_options_html}
+            </select>
             <input type="text" id="repo-filter" class="filter-input" placeholder="リポジトリ名・説明で絞り込み..." oninput="filterRepos()">
         </div>
     </div>
@@ -711,135 +891,196 @@ def main():
     <div id="tab-downloads" class="tab-content active">
         <div class="section-header">
             <h2>リポジトリ別 リリースDL数 ＆ 累計ダウンロード数</h2>
-            <p>各リリースの個別ダウンロード数と、時系列での累計ダウンロード数を並べて表示します</p>
+            <p>カテゴリ別にまとめて表示します。見出しクリックで折りたたみ／展開できます</p>
         </div>
-        <div class="dl-repo-list">
 """
 
-  has_any_release = False
-  for repo in all_stats["all_repositories"]:
-    repo_full = repo["repository"]
-    dom_id = repo["dom_id"]
-    repo_url = f"https://github.com/{repo_full}"
-    desc_text = escape_html(repo["description"])
-    search_blob = escape_html(f"{repo_full} {repo['description']}".lower())
-    priv_badge = '<span class="badge private">Private</span>' if repo["private"] else '<span class="badge">Public</span>'
-    if repo["releases"]:
-      has_any_release = True
-      desc_html = f'<div class="repo-desc" title="{desc_text}">{desc_text}</div>' if desc_text else ""
-      pushed_html = f" / 最終更新: {repo['pushed_at']}" if repo["pushed_at"] else ""
-
-      asset_items_html = ""
-      for rel in repo["releases"]:
-        tag_esc = escape_html(rel["tag_name"])
-        asset_summary = ", ".join(
-            f"{escape_html(a['filename'])} ({a['downloads']:,})"
-            for a in rel.get("assets", [])
-        ) or "アセットなし"
-        asset_items_html += f"<li><b>{tag_esc}</b>（計 {rel['tag_total']:,}）: {asset_summary}</li>"
-
-      html_content += f"""
-            <div class="dl-repo-card searchable-item" data-search="{search_blob}">
-                <div class="card-header">
-                    <h3><a href="{repo_url}" target="_blank">{escape_html(repo_full)}</a></h3>
-                    {priv_badge}
-                </div>
-                {desc_html}
-                <div class="meta-line">合計DL: <b>{repo['total_downloads']:,}</b> 回 / リリース数: {len(repo['releases'])}{pushed_html}</div>
-                <div class="dual-chart-grid">
-                    <div class="chart-box">
-                        <div class="chart-box-title">リリース別 ダウンロード数（個別）</div>
-                        <div class="canvas-wrap"><canvas id="dl-bar-{dom_id}"></canvas></div>
-                    </div>
-                    <div class="chart-box">
-                        <div class="chart-box-title">累計 ダウンロード数（推移・棒グラフ）</div>
-                        <div class="canvas-wrap"><canvas id="dl-cum-{dom_id}"></canvas></div>
-                    </div>
-                </div>
-                <details class="asset-details">
-                    <summary>リリース別アセット内訳を表示</summary>
-                    <ul class="asset-list">{asset_items_html}</ul>
-                </details>
-            </div>
-"""
-
-  if not has_any_release:
+  dl_groups = group_repos_by_category(
+      visible_repositories, predicate=lambda r: bool(r.get("releases"))
+  )
+  if not dl_groups:
     html_content += '<div class="empty-note">リリース情報があるリポジトリはまだありません。</div>'
+  else:
+    for cat_name, cat_repos in dl_groups:
+      cat_esc = escape_html(cat_name)
+      html_content += f"""
+        <section class="category-group" data-category="{cat_esc}">
+            <h3 class="category-heading" onclick="toggleCategory(this)" title="クリックで折りたたみ／展開">📁 {cat_esc} <span class="category-count">{len(cat_repos)}</span><span class="category-toggle-icon">▾</span></h3>
+            <div class="dl-repo-list">
+"""
+      for repo in cat_repos:
+        repo_full = repo["repository"]
+        dom_id = repo["dom_id"]
+        repo_url = f"https://github.com/{repo_full}"
+        desc_text = escape_html(repo["description"])
+        search_blob = escape_html(
+            f"{repo_full} {repo['description']} {cat_name}".lower()
+        )
+        priv_badge = (
+            '<span class="badge private">Private</span>'
+            if repo["private"]
+            else '<span class="badge">Public</span>'
+        )
+        cat_badge = f'<span class="badge cat">{cat_esc}</span>'
+        desc_html = (
+            f'<div class="repo-desc" title="{desc_text}">{desc_text}</div>'
+            if desc_text
+            else ""
+        )
+        pushed_html = (
+            f" / 最終更新: {repo['pushed_at']}" if repo["pushed_at"] else ""
+        )
+
+        asset_items_html = ""
+        for rel in repo["releases"]:
+          tag_esc = escape_html(rel["tag_name"])
+          asset_summary = (
+              ", ".join(
+                  f"{escape_html(a['filename'])} ({a['downloads']:,})"
+                  for a in rel.get("assets", [])
+              )
+              or "アセットなし"
+          )
+          asset_items_html += (
+              f"<li><b>{tag_esc}</b>（計 {rel['tag_total']:,}）:"
+              f" {asset_summary}</li>"
+          )
+
+        html_content += f"""
+                <div class="dl-repo-card searchable-item" data-category="{cat_esc}" data-search="{search_blob}">
+                    <div class="card-header">
+                        <h3><a href="{repo_url}" target="_blank">{escape_html(repo_full)}</a></h3>
+                        <div class="header-badges">{cat_badge}{priv_badge}</div>
+                    </div>
+                    {desc_html}
+                    <div class="meta-line">合計DL: <b>{repo['total_downloads']:,}</b> 回 / リリース数: {len(repo['releases'])}{pushed_html}</div>
+                    <div class="chart-box">
+                        <div class="chart-toolbar">
+                            <div class="chart-box-title" style="margin-bottom:0;">リリース別DL数（左軸・棒） ＆ 累計DL数（右軸・折れ線）</div>
+                            <label class="toggle-switch">
+                                <input type="checkbox" checked onchange="toggleCumulativeLine('{dom_id}', this.checked)">
+                                累計（折れ線）を表示
+                            </label>
+                        </div>
+                        <div class="single-chart-wrap"><canvas id="dl-combo-{dom_id}"></canvas></div>
+                    </div>
+                    <details class="asset-details">
+                        <summary>リリース別アセット内訳を表示</summary>
+                        <ul class="asset-list">{asset_items_html}</ul>
+                    </details>
+                </div>
+"""
+      html_content += """
+            </div>
+        </section>
+"""
 
   html_content += """
-        </div>
     </div>
 
     <div id="tab-loc" class="tab-content">
         <div class="section-header">
             <h2>コード行数（LOC）とコメント内訳</h2>
-            <p>対象拡張子ファイルの純コード・コメント・空行の内訳です</p>
+            <p>カテゴリ別にまとめて表示します。見出しクリックで折りたたみ／展開できます</p>
         </div>
-        <div class="grid-container">
 """
 
-  has_any_loc = False
-  for repo in all_stats["all_repositories"]:
-    repo_full = repo["repository"]
-    dom_id = repo["dom_id"]
-    repo_url = f"https://github.com/{repo_full}"
-    desc_text = escape_html(repo["description"])
-    search_blob = escape_html(f"{repo_full} {repo['description']}".lower())
-    loc = repo["loc_stats"]
-    if loc["total_lines"] > 0:
-      has_any_loc = True
-      desc_html = f'<div class="repo-desc" title="{desc_text}">{desc_text}</div>' if desc_text else ""
-      html_content += f"""
-            <div class="card searchable-item" data-search="{search_blob}">
-                <div class="card-header">
-                    <h3><a href="{repo_url}" target="_blank">{escape_html(repo_full)}</a></h3>
-                    <span class="badge">{repo['file_count']} files</span>
-                </div>
-                {desc_html}
-                <div class="meta-line">コード: <b>{loc['code_lines']:,}</b>行 / コメント: <b>{loc['comment_lines']:,}</b>行 / 空行: {loc['blank_lines']:,}行</div>
-                <div class="canvas-wrap"><canvas id="loc-{dom_id}"></canvas></div>
-            </div>
-"""
-
-  if not has_any_loc:
+  loc_groups = group_repos_by_category(
+      visible_repositories,
+      predicate=lambda r: r.get("loc_stats", {}).get("total_lines", 0) > 0,
+  )
+  if not loc_groups:
     html_content += '<div class="empty-note">集計対象のコードファイルが見つかりませんでした。</div>'
+  else:
+    for cat_name, cat_repos in loc_groups:
+      cat_esc = escape_html(cat_name)
+      html_content += f"""
+        <section class="category-group" data-category="{cat_esc}">
+            <h3 class="category-heading" onclick="toggleCategory(this)" title="クリックで折りたたみ／展開">📁 {cat_esc} <span class="category-count">{len(cat_repos)}</span><span class="category-toggle-icon">▾</span></h3>
+            <div class="grid-container">
+"""
+      for repo in cat_repos:
+        repo_full = repo["repository"]
+        dom_id = repo["dom_id"]
+        repo_url = f"https://github.com/{repo_full}"
+        desc_text = escape_html(repo["description"])
+        search_blob = escape_html(
+            f"{repo_full} {repo['description']} {cat_name}".lower()
+        )
+        loc = repo["loc_stats"]
+        desc_html = (
+            f'<div class="repo-desc" title="{desc_text}">{desc_text}</div>'
+            if desc_text
+            else ""
+        )
+        html_content += f"""
+                <div class="card searchable-item" data-category="{cat_esc}" data-search="{search_blob}">
+                    <div class="card-header">
+                        <h3><a href="{repo_url}" target="_blank">{escape_html(repo_full)}</a></h3>
+                        <span class="badge">{repo['file_count']} files</span>
+                    </div>
+                    {desc_html}
+                    <div class="meta-line">コード: <b>{loc['code_lines']:,}</b>行 / コメント: <b>{loc['comment_lines']:,}</b>行 / 空行: {loc['blank_lines']:,}行</div>
+                    <div class="canvas-wrap"><canvas id="loc-{dom_id}"></canvas></div>
+                </div>
+"""
+      html_content += """
+            </div>
+        </section>
+"""
 
   html_content += """
-        </div>
     </div>
 
     <div id="tab-languages" class="tab-content">
         <div class="section-header">
             <h2>使用言語比率（全体 ＆ リポジトリ別）</h2>
-            <p>GitHub APIから取得した言語バイト数の割合です</p>
+            <p>GitHub APIから取得した言語バイト数の割合を全体およびカテゴリ別一覧で表示します</p>
         </div>
         <div class="global-card">
             <h3>🌍 全リポジトリ合算の言語比率</h3>
             <div class="doughnut-wrap"><canvas id="lang-overall"></canvas></div>
         </div>
-        <div class="grid-container">
 """
 
-  for repo in all_stats["all_repositories"]:
-    repo_full = repo["repository"]
-    dom_id = repo["dom_id"]
-    repo_url = f"https://github.com/{repo_full}"
-    desc_text = escape_html(repo["description"])
-    search_blob = escape_html(f"{repo_full} {repo['description']}".lower())
-    if repo["languages"]:
-      desc_html = f'<div class="repo-desc" title="{desc_text}">{desc_text}</div>' if desc_text else ""
+  lang_groups = group_repos_by_category(
+      visible_repositories, predicate=lambda r: bool(r.get("languages"))
+  )
+  for cat_name, cat_repos in lang_groups:
+    cat_esc = escape_html(cat_name)
+    html_content += f"""
+        <section class="category-group" data-category="{cat_esc}">
+            <h3 class="category-heading" onclick="toggleCategory(this)" title="クリックで折りたたみ／展開">📁 {cat_esc} <span class="category-count">{len(cat_repos)}</span><span class="category-toggle-icon">▾</span></h3>
+            <div class="grid-container">
+"""
+    for repo in cat_repos:
+      repo_full = repo["repository"]
+      dom_id = repo["dom_id"]
+      repo_url = f"https://github.com/{repo_full}"
+      desc_text = escape_html(repo["description"])
+      search_blob = escape_html(
+          f"{repo_full} {repo['description']} {cat_name}".lower()
+      )
+      desc_html = (
+          f'<div class="repo-desc" title="{desc_text}">{desc_text}</div>'
+          if desc_text
+          else ""
+      )
       html_content += f"""
-            <div class="card searchable-item" data-search="{search_blob}">
-                <div class="card-header">
-                    <h3><a href="{repo_url}" target="_blank">{escape_html(repo_full)}</a></h3>
+                <div class="card searchable-item" data-category="{cat_esc}" data-search="{search_blob}">
+                    <div class="card-header">
+                        <h3><a href="{repo_url}" target="_blank">{escape_html(repo_full)}</a></h3>
+                    </div>
+                    {desc_html}
+                    <div class="doughnut-wrap" style="margin-top:10px;"><canvas id="lang-{dom_id}"></canvas></div>
                 </div>
-                {desc_html}
-                <div class="doughnut-wrap" style="margin-top:10px;"><canvas id="lang-{dom_id}"></canvas></div>
+"""
+    html_content += """
             </div>
+        </section>
 """
 
   html_content += f"""
-        </div>
     </div>
 
     <div id="tab-activity" class="tab-content">
@@ -863,10 +1104,30 @@ def main():
 <script>
 const DASHBOARD_DATA = {payload_json};
 const PALETTE = ['#38bdf8', '#34d399', '#a78bfa', '#fbbf24', '#f472b6', '#fb7185', '#2dd4bf', '#818cf8'];
+const DL_CHARTS = {{}};
 
 Chart.defaults.color = '#94a3b8';
 Chart.defaults.borderColor = 'rgba(51, 65, 85, 0.65)';
 Chart.defaults.font.family = "'Inter', 'Noto Sans JP', sans-serif";
+
+function toggleCumulativeLine(domId, showLine) {{
+    const chart = DL_CHARTS[domId];
+    if (!chart) return;
+    if (chart.data.datasets[1]) {{
+        chart.data.datasets[1].hidden = !showLine;
+    }}
+    if (chart.options.scales && chart.options.scales.y1) {{
+        chart.options.scales.y1.display = showLine;
+    }}
+    chart.update();
+}}
+
+function toggleCategory(headingEl) {{
+    const group = headingEl.closest('.category-group');
+    if (!group) return;
+    group.classList.toggle('collapsed');
+    window.dispatchEvent(new Event('resize'));
+}}
 
 function openTab(evt, tabName) {{
     const contents = document.getElementsByClassName("tab-content");
@@ -875,14 +1136,38 @@ function openTab(evt, tabName) {{
     for (const b of buttons) b.classList.remove("active");
     document.getElementById(tabName).classList.add("active");
     evt.currentTarget.classList.add("active");
+    window.dispatchEvent(new Event('resize'));
 }}
 
 function filterRepos() {{
+    const selectedCat = document.getElementById("category-filter").value || "__ALL__";
     const q = (document.getElementById("repo-filter").value || "").trim().toLowerCase();
+
     const items = document.getElementsByClassName("searchable-item");
     for (const el of items) {{
+        const itemCat = el.getAttribute("data-category") || "";
         const hay = el.getAttribute("data-search") || "";
-        el.style.display = (!q || hay.includes(q)) ? "" : "none";
+        const catMatch = (selectedCat === "__ALL__" || itemCat === selectedCat);
+        const textMatch = (!q || hay.includes(q));
+        el.style.display = (catMatch && textMatch) ? "" : "none";
+    }}
+
+    const groups = document.getElementsByClassName("category-group");
+    for (const grp of groups) {{
+        const grpCat = grp.getAttribute("data-category") || "";
+        if (selectedCat !== "__ALL__" && grpCat !== selectedCat) {{
+            grp.style.display = "none";
+            continue;
+        }}
+        const grpItems = grp.getElementsByClassName("searchable-item");
+        let anyVisible = false;
+        for (const it of grpItems) {{
+            if (it.style.display !== "none") {{
+                anyVisible = true;
+                break;
+            }}
+        }}
+        grp.style.display = anyVisible ? "" : "none";
     }}
 }}
 
@@ -890,29 +1175,54 @@ document.addEventListener("DOMContentLoaded", () => {{
     for (const repo of DASHBOARD_DATA.repositories) {{
         const dl = repo.dl_chart;
         if (dl && dl.tags && dl.tags.length > 0) {{
-            const barEl = document.getElementById(`dl-bar-${{repo.dom_id}}`);
-            if (barEl) {{
-                new Chart(barEl, {{
+            const comboEl = document.getElementById(`dl-combo-${{repo.dom_id}}`);
+            if (comboEl) {{
+                DL_CHARTS[repo.dom_id] = new Chart(comboEl, {{
                     type: 'bar',
                     data: {{
                         labels: dl.tags,
-                        datasets: [{{
-                            label: 'リリース別DL数',
-                            data: dl.per_release,
-                            backgroundColor: 'rgba(52, 211, 153, 0.8)',
-                            borderColor: '#34d399',
-                            borderWidth: 1,
-                            borderRadius: 6
-                        }}]
+                        datasets: [
+                            {{
+                                type: 'bar',
+                                label: '個別DL数',
+                                yAxisID: 'y',
+                                data: dl.per_release,
+                                backgroundColor: 'rgba(52, 211, 153, 0.78)',
+                                borderColor: '#34d399',
+                                borderWidth: 1,
+                                borderRadius: 6,
+                                order: 2
+                            }},
+                            {{
+                                type: 'line',
+                                label: '累計DL数',
+                                yAxisID: 'y1',
+                                data: dl.cumulative,
+                                borderColor: '#38bdf8',
+                                backgroundColor: 'rgba(56, 189, 248, 0.2)',
+                                pointBackgroundColor: '#38bdf8',
+                                pointBorderColor: '#0f172a',
+                                pointRadius: 4,
+                                borderWidth: 2.5,
+                                tension: 0.25,
+                                fill: false,
+                                order: 1
+                            }}
+                        ]
                     }},
                     options: {{
                         responsive: true,
                         maintainAspectRatio: false,
+                        interaction: {{
+                            mode: 'index',
+                            intersect: false
+                        }},
                         plugins: {{
-                            legend: {{ display: false }},
+                            legend: {{ display: true, position: 'top' }},
                             tooltip: {{
                                 callbacks: {{
                                     afterLabel: (ctx) => {{
+                                        if (ctx.datasetIndex !== 0) return null;
                                         const diff = dl.diffs[ctx.dataIndex] ?? 0;
                                         if (diff > 0) return `前回比: +${{diff.toLocaleString()}}`;
                                         if (diff < 0) return `前回比: ${{diff.toLocaleString()}}`;
@@ -922,33 +1232,21 @@ document.addEventListener("DOMContentLoaded", () => {{
                             }}
                         }},
                         scales: {{
-                            y: {{ beginAtZero: true, ticks: {{ precision: 0 }} }}
-                        }}
-                    }}
-                }});
-            }}
-
-            const cumEl = document.getElementById(`dl-cum-${{repo.dom_id}}`);
-            if (cumEl) {{
-                new Chart(cumEl, {{
-                    type: 'bar',
-                    data: {{
-                        labels: dl.tags,
-                        datasets: [{{
-                            label: '累計DL数',
-                            data: dl.cumulative,
-                            backgroundColor: 'rgba(56, 189, 248, 0.8)',
-                            borderColor: '#38bdf8',
-                            borderWidth: 1,
-                            borderRadius: 6
-                        }}]
-                    }},
-                    options: {{
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: {{ legend: {{ display: false }} }},
-                        scales: {{
-                            y: {{ beginAtZero: true, ticks: {{ precision: 0 }} }}
+                            y: {{
+                                type: 'linear',
+                                position: 'left',
+                                beginAtZero: true,
+                                ticks: {{ precision: 0 }},
+                                title: {{ display: true, text: '個別DL' }}
+                            }},
+                            y1: {{
+                                type: 'linear',
+                                position: 'right',
+                                beginAtZero: true,
+                                ticks: {{ precision: 0 }},
+                                grid: {{ drawOnChartArea: false }},
+                                title: {{ display: true, text: '累計DL' }}
+                            }}
                         }}
                     }}
                 }});
