@@ -85,7 +85,9 @@ python github_dashboard.py
 
 ```
 
-*※Windows環境のパス区切りも、スラッシュ (`/`) で記述するとエスケープエラーを防げます。*
+*※Windows環境のパス区切りも、スラッシュ (`/`) で記述するとエスケープエラーを防げます。パス変換やコピーをGUIで行いたい場合は [Windows-json-path-helper](https://github.com/MustangTIS/Windows-json-path-helper) も活用できます。*
+
+```
 
 ### 4. ダッシュボードの生成
 
